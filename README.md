@@ -1,0 +1,384 @@
+---
+license: mit
+language:
+- en
+library_name: transformers
+pipeline_tag: text-generation
+tags:
+- llama
+- text-generation
+- multimodal
+- any-to-any
+- image-to-text
+- text-to-image
+- from-scratch
+- 1t
+- fsdp
+- aimytog
+datasets:
+- HuggingFaceFW/fineweb
+- HuggingFaceFW/fineweb-edu
+---
+
+# MNAI Nyx 1.1
+
+**AIMYTOG: AI Model You'll Train On GPU.**
+
+**ANY-to-ANY: text, image, and audio in, text, image, and audio out. One model reads and writes all three.**
+
+A 1.05T parameter frontier any-to-any model, from scratch. You bring the GPU. The repo is the model, the training code, and the tokenizer. Nothing is pre-trained here. You train it yourself, on your own cluster, with your own data. That is the whole point.
+
+> MNAI Nyx family is a real legit AI, That YOU have to train.
+
+The data is the ENTIRE web. The full FineWeb crawl, 15 trillion tokens of open web text, plus FineWeb-Edu. FineWeb comes from Common Crawl, which visits every website it can reach, every domain, even the random ones. If a page is on the internet, it is in the crawl. That is the largest open web corpus there is.
+
+This is the middle child of the Nyx family, and that is the point. Nyx 1 is 504.5B and Nyx 1.2 is 2.21T. Nyx 1.1 sits between them at 1.05T: twice the model of Nyx 1, half the model of Nyx 1.2, on a cluster half the size of the one 1.2 needs. Same tech, same data, same any-to-any design, just the size that fits a 256-GPU cluster.
+
+## The Nyx family
+
+| Model | Params | What it needs | Repo |
+|---|---|---|---|
+| Nyx 0.5 | 2.1B | one 24GB GPU | https://github.com/MeowSamOPDZN/mnai-nyx-0-5 |
+| Nyx 1 | 504.5B | 128x H100 minimum | https://github.com/MeowSamOPDZN/mnai-nyx-1 |
+| **Nyx 1.1** | **1.070T** | 256x H100 minimum | this repo |
+| Nyx 1.2 | 2.21T | 512x H100 minimum | https://github.com/MeowSamOPDZN/mnai-nyx-1-2 |
+
+Same AIMYTOG tech in all four: you train it yourself, you rename it to your own LLM, the weights and the GGUF are locked.
+
+## The model
+
+MNAI Nyx 1.1. From scratch, no base model, no distillation.
+
+| | |
+|---|---|
+| Params | **1,069,938,186,512 (1.070T)** — core text 1.054T + vision 3.81B + image decoder 11.41B + audio 0.73B |
+| Architecture | Llama decoder, GQA, SwiGLU, RoPE, RMSNorm + ViT vision encoder + DiT image decoder + audio encoder/decoder |
+| Modalities | text, image, audio in and out |
+| Hidden | 28672 |
+| Layers | 125 |
+| Heads | 224 query, 8 key/value |
+| FFN | 77824 |
+| Vocab | 152064 |
+| Context | 8192 |
+| Embeddings | tied |
+
+Standard Llama block layout, so llama.cpp can turn a finished checkpoint into a GGUF with its normal converter.
+
+## The data
+
+The entire web. The training stream is the full FineWeb crawl (15T tokens) plus FineWeb-Edu, interleaved 80/20. A 1.1T model wants about 21T tokens, more than the whole internet holds, so it trains on the full 15T, every website, every domain, even the random ones.
+
+The data pipeline is in this repo, in `data.py`, and it is the whole job, not 5% of it:
+
+- **15T tokens, streamed.** FineWeb (the full Common Crawl, every website, every domain, even the random ones) plus FineWeb-Edu. Nothing is downloaded in bulk, the stream is tokenized on the fly and packed into fixed blocks.
+- **Filtering.** Documents shorter than 200 chars, boilerplate (cookie banners, nav bars, copyright footers), and docs that are mostly non-letters are dropped before they reach the model.
+- **Dedup.** Exact dedup by SHA-256 hash of the normalized text, plus near-dup dedup by 8-word shingles with Jaccard similarity. The same article copied across a hundred sites is trained on once.
+- **Domain-balanced mix.** `--data-mix domain` trains on web 50%, books 15% (Project Gutenberg), code 15% (The Stack), academic 10% (peS2o papers), synthetic 10%. The default mix is web 80% / edu 20%, and any mix can be set with `--data-mix "web:0.5,books:0.2,code:0.2,academic:0.1"`.
+- **Synthetic data.** `synthetic.py` generates training text from an earlier checkpoint and mixes it into the stream, so the model writes its own training data once it is good enough to write coherent text.
+
+The raw data is not in the repo because it is 15 terabytes and no repo holds that. The pipeline that fetches it, cleans it, dedups it, balances it, and feeds it to the model is in the repo. That pipeline is the moat.
+
+## Dense vs MoE
+
+Both are supported. Dense is the default, MoE is an option.
+
+The dense model is the 1.054T text core above: every token runs through every parameter. The MoE variant swaps each block's SwiGLU MLP for a Mixture-of-Experts layer (`MoELayer` in `model.py`): a router picks the top 2 of 8 experts per token, each expert is a full SwiGLU MLP, and a load-balancing aux loss keeps the router from starving any expert.
+
+| | Dense (default) | MoE, 8 experts, top-2 |
+|---|---|---|
+| Total params (text core) | 1.054T | 6.911T |
+| Active params per token | 1.054T | 1.891T |
+| Share of the model a token touches | 100% | 27.4% |
+
+MoE holds far more capacity while activating far fewer params per token, which is why frontier models use it. The trade is complexity: routing, load balancing, and sharding experts across GPUs. Dense is simpler and every tool that reads a Llama checkpoint reads it as-is.
+
+```bash
+# train the MoE variant (text core, 8 experts, top-2 routing)
+torchrun --nproc_per_node=8 --nnodes=64 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-nyx11-moe \
+  --moe-experts 8 --moe-topk 2 --max-tokens 15000000000000
+
+# count the MoE params without allocating memory
+python model.py --moe-experts 8 --moe-topk 2
+```
+
+## Quantized models
+
+A trained checkpoint is about 2.1TB in bf16. Quantization shrinks it so it can actually run. `quantize.py` turns any trained checkpoint into two GGUF files with llama.cpp:
+
+| Quant | Bytes per param | Size (1.054T text core) | Best for |
+|---|---|---|---|
+| Q4_K_M | ~0.55 | ~580 GB | the smallest file that still answers well |
+| Q8_0 | ~1.0 | ~1,054 GB | near-original quality, still half the size of bf16 |
+
+```bash
+# produces model-q4-k-m.gguf and model-q8-0.gguf in out-gguf/
+python quantize.py --ckpt out-nyx11/ckpt-5000 --out out-gguf
+```
+
+The Q files are produced from a trained checkpoint once someone trains the model. The script is ready now: point it at any checkpoint, even a smoke checkpoint, and it produces both files. Only the text core becomes a GGUF, because llama.cpp converts Llama models; the any-to-any modality modules stay in PyTorch.
+
+## Scaling
+
+Before burning a cluster on a 1.1T run, frontier labs check the shape on small proxy runs. `scaling.py` does that: it trains three tiny models with the exact same Llama block layout (1M, 5M, 20M params) on real text at one learning rate, fits a Chinchilla-style power law (loss = A * N^-alpha) in log space, and extrapolates the predicted loss at the full 1.070T scale.
+
+```bash
+# about 5 minutes on CPU, no GPU, no data download
+python scaling.py
+python scaling.py --steps 300 --out scaling-report.json
+```
+
+A clean result is a loss that falls smoothly with size, a fitted power law with a small residual, and a predicted loss at full scale that is sane, not exploding. The default run (300 steps, LR 1e-3) gives proxy losses 2.32, 2.26, 2.26 and predicts a loss of about 2.07 at 1.070T. That is the evidence a shape can converge. It is not a guarantee. Only the full run is.
+
+Read the numbers honestly, because the flattening is real: the three proxies come in at 2.32, 2.26, 2.26. The 20M proxy barely beats the 5M one. That is what tiny proxies on a tiny corpus do — at 300 steps the bigger proxy is undertrained, so the fit is an extrapolation, not a measurement. What is proven: the shape converges at small scale, the power law fits with a small residual, and the predicted loss at 1.070T is sane. What is NOT proven: a full 1.070T run. Nobody has run one yet — that is the point of AIMYTOG, you run it. Gradient instabilities, MoE routing collapse, and multimodal alignment across text, vision, and audio are exactly the things a full run would shake out. Before you start one, run `validate_cluster.py` on the cluster: it checks distributed init, all-reduce, FSDP sharding, MoE router balance, and multimodal outputs on a tiny model first. And `train.py` guards the run itself: gradient clipping, a loss spike guard that drops bad steps and reloads the last checkpoint, and for MoE a load-balancing aux loss, a router z-loss, and a per-expert capacity factor.
+
+## Hardware
+
+A 1.1T model does not fit on one GPU. Training needs a cluster with FSDP.
+
+Per GPU, bf16 weights + 8-bit Adam, FSDP full shard:
+
+| GPUs | States per GPU |
+|---|---|
+| 256x H100 80GB | ~25GB |
+| 512x H100 80GB | ~12GB |
+
+256x H100 is the minimum, 512x is ideal. Do not try this on fewer than 256 GPUs unless you know what you are doing. Activations with gradient checkpointing need the rest of the memory.
+
+A full run is the entire internet, 15T tokens. At 512x H100, expect roughly 1-2 years. This is a frontier run, not a weekend project.
+
+## Parallelism
+
+train.py shards the model with PyTorch FSDP by default. That is fine up to about 128 GPUs. Past that, pure FSDP all-reduces the full gradient set across nodes every step, and the inter-node network becomes the bottleneck — at 1.1T (6.9T in MoE mode) that is the wall. Real frontier labs do not run pure FSDP at that scale; they split three ways at once, and this repo does the same when you ask for it.
+
+parallel.py builds the 3D mesh: tensor parallel inside a node (8 GPUs, where NVLink is fast), pipeline parallel across layers, data parallel for the rest, with FSDP only inside the data parallel group. MoE experts get expert parallel on top.
+
+```bash
+# what should I use for N GPUs? prints the plan and the warning
+python train.py --parallel-plan 256
+python parallel.py --plan 256 --moe-experts 8
+
+# train with 3D parallel instead of pure FSDP
+torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --parallel-strategy 3d
+```
+
+The plan command is the honest one: below 256 GPUs it tells you to stay on FSDP, because 3D parallel is extra machinery you do not need. Above it, it warns you and switches. One note on this model: 125 layers divide cleanly only by 1, 5, 25 and 125, so pipeline parallel degrees are limited — the plan command picks a valid split for you.
+
+## Post-training
+
+Pre-training teaches the model to autocomplete the internet. It does not teach it to answer a question, follow an instruction, or write code on request. A raw pre-trained checkpoint is not a chat assistant, and this repo does not pretend otherwise. Post-training is two steps, both included:
+
+1. SFT — supervised fine-tuning on instruction/response pairs. The loss is only on the response tokens, so the model learns to produce the answer, not to predict the question. `sft.py` takes a pre-trained checkpoint and a JSONL of pairs, and it ships with a small built-in sample set so the smoke test runs offline.
+
+```bash
+# 3 steps on CPU, proves the masking and the optimizer step work
+python sft.py --smoke
+
+# from a pre-trained checkpoint
+python sft.py --model out-nyx11/ckpt-5000 --data ./sft.jsonl --out out-sft --epochs 3 --lr 2e-5
+```
+
+2. DPO — Direct Preference Optimization on chosen/rejected pairs. It pushes the model to prefer the better reply, with a frozen reference model anchoring it so it cannot drift away from the SFT model to game the pairs. No reward model, no PPO loop. GRPO is the follow-up if you want on-policy RL later.
+
+```bash
+python dpo.py --smoke
+python dpo.py --model out-sft --data ./dpo.jsonl --out out-dpo --epochs 1 --lr 5e-7
+```
+
+The pipeline is: pretrain -> SFT -> DPO (-> GRPO). Skip SFT and DPO gives you a model that autocompletes; skip DPO and you get a model that answers but has never been told which answer is better.
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+
+# 1. Train the tokenizer on your own text
+python train_tokenizer.py --data ./data/*.txt --out ./tokenizer
+
+# 2. Train, torchrun, one process per GPU
+torchrun --nproc_per_node=8 --nnodes=64 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-nyx11 \
+  --max-tokens 15000000000000 --micro-batch 1 --grad-accum 4096
+
+# 3. Resume after a stop
+torchrun --nproc_per_node=8 --nnodes=64 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-nyx11 \
+  --resume out-nyx11/ckpt-500 --max-tokens 15000000000000
+
+# 4. Generate (needs a sharded inference engine for the full 1.1T,
+#    vLLM or TensorRT-LLM, this script is for a small test checkpoint)
+python generate.py --model out-nyx11/ckpt-1000 --prompt "The future of AI is"
+```
+
+## Training options
+
+```bash
+# WSD schedule with WandB logging and validation perplexity
+torchrun --nproc_per_node=8 --nnodes=64 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-nyx11 \
+  --scheduler wsd --decay-frac 0.1 --wandb --wandb-project nyx11 \
+  --eval-every 1000 --eval-batches 20
+
+# Adafactor optimizer, fp16, custom data mix
+torchrun --nproc_per_node=8 --nnodes=64 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-nyx11 \
+  --optim adafactor --dtype fp16 --data-mix "fineweb:0.7,fineweb-edu:0.3"
+```
+
+Schedulers: `cosine` (classic), `linear`, `wsd` (warmup-stable-decay,
+holds steady then decays at the end, good when you might stop early).
+Optimizers: `bnb8bit` (default), `adamw`, `adafactor`, `sgd`.
+
+## Evaluate a checkpoint
+
+```bash
+# perplexity, HellaSwag, ARC, Winogrande, and sample generations
+python evaluate.py --model out-nyx11/ckpt-1000 --limit 200
+
+# perplexity on your own text file
+python evaluate.py --model out-nyx11/ckpt-1000 --val-file ./val.txt
+```
+
+## Smoke test
+
+No GPU, no data download. Uses a tiny twin of the same block layout.
+
+```bash
+python train.py --smoke --max-steps 3 --out /tmp/smoke-nyx11
+python model.py
+```
+
+## Make your OWN named LLM
+
+This repo is a template. Rename the model to yours in 2 minutes, 4 small changes. Example: rename it to **MyCoolModel**.
+
+**Step 1 — model.py, line 97.** Open `model.py`, find this line:
+```python
+MODEL_NAME = "MNAI Nyx 1.1"
+```
+Change it to:
+```python
+MODEL_NAME = "MyCoolModel"
+```
+That is the only code change. The name shows up in the model description and logs from here on.
+
+**Step 2 — README.md, line 23.** Open `README.md`, find this line:
+```markdown
+# MNAI Nyx 1.1
+```
+Change it to:
+```markdown
+# MyCoolModel
+```
+
+**Step 3 — train.py, line 138.** Open `train.py`, find this line:
+```python
+p.add_argument("--out", default="out-nyx11")
+```
+Change it to:
+```python
+p.add_argument("--out", default="out-mycoolmodel")
+```
+That is just the default output folder name for your checkpoints. You can also leave it and pass `--out` yourself every run.
+
+**Step 4 — config.json.** Nothing to change. There is no name field in `config.json`, the shape is the same whatever you call the model.
+
+That is it. Train it, and the model that comes out is MyCoolModel, trained by you, on your data, on your GPU.
+
+**One rule.** Once you rename it, it is your LLM. But the weights and the GGUF are locked — no one can change them or re-release them as something else. The only thing you owe is credit: put the text `Your Brand x MNAI` on it, with your brand name in place of "Your Brand".
+
+## Files
+
+| File | What it is |
+|---|---|
+| `model.py` | The 1.1T architecture (MNAI Nyx 1.1), param count, FLOPs, init, surgery helpers, MoE layers |
+| `multimodal.py` | Any-to-any modules: ViT vision encoder, DiT image decoder, audio encoder/decoder |
+| `train.py` | FSDP2 distributed training (3D parallel option), schedulers, optimizers, WandB, eval, full checkpoints, loss spike guard, MoE training with aux + z-loss |
+| `data.py` | Data loading, filtering, dedup, tokenization, dataset mixing, domain-balanced mix |
+| `scaling.py` | Scaling-law check: tiny proxy runs, power-law fit, predicted loss at 1.070T |
+| `quantize.py` | Checkpoint to GGUF: Q4_K_M and Q8_0 via llama.cpp |
+| `synthetic.py` | Generate synthetic training text from a checkpoint for the data mix |
+| `evaluate.py` | Perplexity, HellaSwag / ARC / Winogrande benchmarks, generation quality |
+| `utils.py` | Logging, seeding, distributed helpers, checkpoints, memory profiling |
+| `inference.py` | Generation with KV cache, batched generation, sampling, chat |
+| `train_tokenizer.py` | Byte-level BPE tokenizer, 152064 tokens |
+| `generate.py` | Text generation from a checkpoint, CLI wrapper around inference.py |
+| `config.json` | Model config, HF format |
+| `requirements.txt` | Dependencies |
+| `parallel.py` | 3D parallelism: tensor + pipeline + data parallel, expert parallel, GPU plan |
+| `sft.py` | Supervised fine-tuning on instruction/response pairs |
+| `dpo.py` | Direct Preference Optimization on chosen/rejected pairs |
+| `validate_cluster.py` | Cluster pre-flight checks before a big run |
+| `LICENSE` | MIT License for the code in this repo |
+| `LICENSE-WEIGHTS` | MNAI Weights License for trained weights and GGUF files |
+
+## License
+
+Two licenses, on purpose. The code in this repo is MIT licensed — train it, use it, sell it, change it, the code is yours to do what you want with. The trained weights and GGUF files are under the MNAI Weights License (LICENSE-WEIGHTS): you may use them and share them unchanged, but you may not modify them and re-release them, and you may not re-release them under a different name. The weights are locked to the model they came from. Training your own model — pre-training, SFT, DPO — is how the weights are made, not a re-release. Rename the model to your own brand, and put the text `Your Brand x MNAI` on it, with your brand name in place of "Your Brand". That credit is the only thing you owe.
+
+## FAQ
+
+**Is MNAI Nyx a real AI?**
+MNAI Nyx family is a real legit AI, That YOU have to train.
+
+**What is MNAI Nyx 1.1?**
+MNAI Nyx 1.1 is a 1.05T parameter frontier large language model, built from scratch by MeowSamOPDZN Studio. It is the middle size of the Nyx family: twice Nyx 1, half of Nyx 1.2.
+
+**What is AIMYTOG?**
+AIMYTOG stands for AI Model You'll Train On GPU. It is a new technology from MeowSamOPDZN Studio: instead of downloading a pre-trained model, you train the model yourself on your own GPU cluster. The repo gives you the model, the training code, and the tokenizer. You bring the GPU.
+
+**Can I train MNAI Nyx 1.1 myself?**
+Yes. That is the whole point. The repo is public. You need a GPU cluster (256x H100 minimum, 512x recommended), the training code uses FSDP to shard the 1.1T model across all your GPUs.
+
+**What hardware do I need?**
+256x H100 80GB minimum, 512x ideal. Per GPU, bf16 weights + 8-bit Adam states come to about 25GB on 256 GPUs and about 12GB on 512 GPUs, leaving room for activations with gradient checkpointing. Do not try it on fewer than 256 GPUs unless you know what you are doing.
+
+**What data does MNAI Nyx 1.1 train on?**
+The entire web. The full FineWeb crawl, 15 trillion tokens of open web text, plus FineWeb-Edu. FineWeb comes from Common Crawl, which visits every website it can reach, every domain, even the random ones.
+
+**Is MNAI Nyx 1.1 open source?**
+Yes. The code is MIT licensed and public on GitHub. The trained weights are under the MNAI Weights License — free to use and share unchanged, locked against modification and re-release under another name. The model is yours once you train it.
+
+**How big is MNAI Nyx 1.1?**
+1.070 trillion parameters. Core text is 1.054T (28672 hidden, 125 layers, 224 attention heads, 152064 token vocabulary, 8192 context), plus the any-to-any modules: vision encoder 3.81B, image decoder 11.41B, audio encoder and decoder 0.73B.
+
+**Is MNAI Nyx 1.1 any-to-any?**
+Yes. Text, image, and audio in, text, image, and audio out. One model reads and writes all three. The vision encoder, DiT image decoder, and audio encoder/decoder live in multimodal.py.
+
+**How is 1.1 different from Nyx 1, 1.2 and 0.5?**
+Same family, same tech, different size. Nyx 0.5 is 2B and trains on one GPU. Nyx 1 is 504.5B and needs 128x H100 minimum. Nyx 1.1 is 1.070T and needs 256x H100 minimum. Nyx 1.2 is 2.21T and needs 512x H100 minimum. 1.1 is the middle size: twice the model of Nyx 1 on twice the cluster, half the model of Nyx 1.2 on half the cluster.
+
+**Has the architecture been proven at scale?**
+The shape is the standard Llama block layout, the same one LLaMA and Mistral use, with GQA and SwiGLU. Before a full run, `scaling.py` trains three tiny models with the exact same layout, fits a power law to their losses, and predicts the loss at 1.070T. A clean falling trend is the evidence the shape converges. One honest note: the proxy losses flatten at 2.32, 2.26, 2.26 — the 20M proxy barely beats the 5M one, because at 300 steps on a tiny corpus the bigger proxy is undertrained. The fit is an extrapolation, not a guarantee. What is proven is that the shape converges at small scale with a sane predicted loss; what is not proven is a full 1.070T cluster run, because nobody has run one yet. `validate_cluster.py` checks the cluster setup before you start one. The full 1.1T run itself is what you do when you train it, and `train.py` has a loss spike guard that drops any step above 3x the running average and reloads the last checkpoint, so one bad batch cannot wreck the run.
+
+**Does the repo include the data pipeline?**
+Yes. `data.py` is the pipeline: 15T tokens of FineWeb plus FineWeb-Edu streamed and tokenized on the fly, document filtering, exact dedup by hash, near-dup dedup by shingles, a domain-balanced mix (web 50%, books 15%, code 15%, academic 10%, synthetic 10%), and synthetic data generation in `synthetic.py`. The raw 15TB is not in the repo because no repo holds 15TB. The pipeline that fetches, cleans, dedups, and balances it is.
+
+**Is Nyx dense or MoE?**
+Both. Dense is the default: 1.054T, every token runs through every parameter. MoE is an option (`--moe-experts 8 --moe-topk 2`): 6.911T total, 1.891T active per token, so a token touches 27.4% of the model. MoE holds more capacity for less compute per token, dense is simpler and every Llama tool reads it as-is.
+
+**Are there quantized models?**
+Yes, two. `quantize.py` turns a trained checkpoint into Q4_K_M (~580 GB) and Q8_0 (~1,054 GB) GGUFs with llama.cpp. The Q files are produced once someone trains the model; the script is ready now and works on any checkpoint, even a smoke checkpoint.
+
+**Is MNAI Nyx worth training?**
+Yes, if you have the cluster and you want a frontier model that is yours. It is the only public repo that gives you a 1.05T any-to-any model, the full data pipeline for the entire internet, a scaling-law check, dense and MoE, and quantized outputs, all from scratch, code MIT licensed and weights under the MNAI Weights License. You bring the GPU, you train it, and the model that comes out is yours. MNAI Nyx family is a real legit AI, That YOU have to train.
+
+**Why not just use FSDP?**
+FSDP is the default and it is fine up to about 128 GPUs. Past 256 GPUs it all-reduces the full gradient set across nodes every step, and the network becomes the wall. `parallel.py` builds a 3D mesh — tensor parallel inside a node, pipeline parallel across layers, FSDP only inside the data parallel group — and `train.py --parallel-plan N` tells you which one to use for your GPU count.
+
+**How do I turn the pre-trained model into a chat assistant?**
+Post-training, two steps. SFT first (`sft.py`, instruction/response pairs, loss only on the response), then DPO (`dpo.py`, chosen/rejected pairs, frozen reference model). The pipeline is pretrain -> SFT -> DPO (-> GRPO). A raw pre-trained checkpoint only autocompletes internet text.
+
+**What license are the weights under?**
+The MNAI Weights License (LICENSE-WEIGHTS). The code is MIT; the weights are not. You may use the weights and share them unchanged, but you may not modify them and re-release them, and you may not re-release them under a different name. Rename the model to your own brand and put `Your Brand x MNAI` on it. Training your own model — pre-training, SFT, DPO — is how the weights are made, not a re-release.
+
+## Credits
+
+Built by MeowSamOPDZN Studio. The 1.05T shape is ours, the Llama block layout is standard so tooling just works.
